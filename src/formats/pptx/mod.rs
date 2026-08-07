@@ -31,8 +31,6 @@ const MASTER_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
 const NOTES_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
-const SLIDE_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
-
 /// Namespaces whose markup this frontend understands; `mc:Choice` branches
 /// requiring anything else fall back to `mc:Fallback`.
 const SUPPORTED_NS: &[&str] = &[ns::P, ns::A, ns::R, ns::MC];
@@ -93,35 +91,34 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut failed = 0usize;
     let instance_counter = StdCell::new(0u64);
-    // Every slide has a start anchor id so internal slide-to-slide links
-    // resolve after concatenation; the anchor node is emitted only on
-    // slides some link actually targets.
-    let slide_anchors: HashMap<String, String> = slide_paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.clone(), format!("slide-{}", i + 1)))
-        .collect();
+    // Slide identity is positional in `sldIdLst`, so this path-keyed map is
+    // only for resolving internal slide-to-slide links. If a malformed deck
+    // lists one part more than once, links keep the first occurrence's
+    // identity instead of being retargeted by a later map insertion.
+    let mut slide_anchors: HashMap<String, String> = HashMap::new();
+    for (slide_index, slide_path) in slide_paths.iter().enumerate() {
+        slide_anchors
+            .entry(slide_path.clone())
+            .or_insert_with(|| format!("slide-{}", slide_index + 1));
+    }
     let mut all_rels: Vec<Relationships> = Vec::with_capacity(slide_paths.len());
     for p in &slide_paths {
         all_rels.push(read_rels(&mut pkg.borrow_mut(), &rels_part_for(p))?);
     }
-    let targeted: std::collections::HashSet<String> = slide_paths
-        .iter()
-        .zip(&all_rels)
-        .flat_map(|(p, rels)| {
-            rels.iter()
-                .filter(|(_, r)| r.rel_type == SLIDE_REL && r.mode == TargetMode::Internal)
-                .filter_map(move |(_, r)| path::resolve(p, &r.target).ok().map(|t| t.path))
-        })
-        .filter(|t| slide_anchors.contains_key(t))
-        .collect();
+    let mut emitted_content_slide = false;
 
     for (slide_index, slide_path) in slide_paths.iter().enumerate() {
+        // Unlike link resolution above, emission must preserve every
+        // positional occurrence, including duplicate paths.
+        let mut slide_blocks =
+            vec![Block::Paragraph(vec![Inline::Anchor(format!("slide-{}", slide_index + 1))])];
+
         let tree = match pkg.borrow_mut().optional_xml_part(slide_path)? {
             Some(t) => t,
             None => {
                 log::warn!("skipping unusable slide {slide_path}");
                 failed += 1;
+                blocks.extend(slide_blocks);
                 continue;
             }
         };
@@ -132,6 +129,7 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         else {
             log::warn!("skipping slide {slide_path}: no shape tree");
             failed += 1;
+            blocks.extend(slide_blocks);
             continue;
         };
         let slide_rels = &all_rels[slide_index];
@@ -163,12 +161,7 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
             instance_counter: &instance_counter,
             slide_anchors: &slide_anchors,
         };
-        if targeted.contains(slide_path)
-            && let Some(anchor) = slide_anchors.get(slide_path)
-        {
-            blocks.push(Block::Paragraph(vec![Inline::Anchor(anchor.clone())]));
-        }
-        parse_shapes(sp_tree, &ctx, &mut blocks)?;
+        parse_shapes(sp_tree, &ctx, &mut slide_blocks)?;
 
         // Speaker notes, set off as a quote (fixed policy: included). The
         // tree is loaded before the `if let` so the package borrow is not
@@ -203,8 +196,16 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
                 }
             }
             if !notes_blocks.is_empty() {
-                blocks.push(Block::BlockQuote(notes_blocks));
+                slide_blocks.push(Block::BlockQuote(notes_blocks));
             }
+        }
+        let has_content = slide_blocks.len() > 1;
+        if has_content && emitted_content_slide {
+            blocks.push(Block::Rule);
+        }
+        blocks.extend(slide_blocks);
+        if has_content {
+            emitted_content_slide = true;
         }
     }
     if failed == slide_paths.len() {
