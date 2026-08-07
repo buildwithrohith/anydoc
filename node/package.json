@@ -31,7 +31,8 @@
     "index.js",
     "index.d.ts",
     "cli.js",
-    "README.md"
+    "README.md",
+    "anydoc.*.node"
   ],
   "engines": {
     "node": ">= 20"
